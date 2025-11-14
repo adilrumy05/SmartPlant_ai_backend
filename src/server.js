@@ -7,7 +7,8 @@ import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import cors from 'cors';
-import { // Import helper functions from db.js for database operations
+
+import pool, {
   getOrCreateSpeciesId,
   insertObservation,
   insertAiResults,
@@ -15,18 +16,28 @@ import { // Import helper functions from db.js for database operations
   listObservationsByStatus,
   updateObservationStatus,
   updateObservation,
+  insertSpecies,
+  attachObservationToSpecies,
 } from './db.js';
-
 
 // Environment setup and Express app configuration
 const __filename = fileURLToPath(import.meta.url); // Get the current file path 
 const __dirname = path.dirname(__filename); // Get the current directory path
 const app = express(); // Initialize the Express application
+const SPECIES_IMAGE_ROOT = path.join(__dirname, '..', 'species_images');
 
 app.use((req, _res, next) => {
   console.log(`[req] ${req.method} ${req.url}`);
   next();
 });
+
+async function getScientificNameById(species_id) {
+  const [rows] = await pool.query(
+    'SELECT scientific_name FROM species WHERE species_id = ? LIMIT 1',
+    [species_id]
+  );
+  return rows.length ? rows[0].scientific_name : null;
+}
 
 // Python worker, which loads the AI model once and handles all inferences
 let pyWorker = null; // Will store the persistent Python process reference
@@ -148,6 +159,8 @@ adminRouter.get('/observations', async (req, res) => {
       photo: r.photo_url?.startsWith('/') ? origin + r.photo_url : r.photo_url,
       submitted_at: r.created_at,
       location: r.location_name || '',
+      location_latitude: r.location_latitude,
+      location_longitude: r.location_longitude,
       user: r.user_id ? `user_${r.user_id}` : '',
     }));
 
@@ -191,6 +204,143 @@ adminRouter.put('/observations/:id/reject', async (req, res) => {
     res.status(500).json({ error: 'Failed to reject' });
   }
 });
+
+// Admin confirms observation as an EXISTING species
+app.post('/api/admin/observations/:id/confirm-existing', async (req, res) => {
+  try {
+    const observation_id = Number(req.params.id);
+    const { species_id, scientific_name } = req.body;
+
+    if (!Number.isFinite(observation_id)) {
+      return res.status(400).json({ error: 'Invalid observation_id' });
+    }
+
+    let resolvedSpeciesId = null;
+    let sciName = null;
+
+    if (species_id != null) {
+      resolvedSpeciesId = Number(species_id);
+      if (!Number.isFinite(resolvedSpeciesId)) {
+        return res.status(400).json({ error: 'Invalid species_id' });
+      }
+      sciName = await getScientificNameById(resolvedSpeciesId);
+    } else if (scientific_name) {
+      const cleaned = scientific_name.trim();
+      if (!cleaned) {
+        return res.status(400).json({ error: 'scientific_name cannot be empty' });
+      }
+      // use existing helper to get or create the species row
+      resolvedSpeciesId = await getOrCreateSpeciesId(cleaned);
+      sciName = cleaned;
+    } else {
+      return res.status(400).json({
+        error: 'species_id or scientific_name is required',
+      });
+    }
+
+    const detail = await getObservationWithResults(observation_id);
+    if (!detail || !detail.observation) {
+      return res.status(404).json({ error: 'Observation not found' });
+    }
+
+    const photoUrl = detail.observation.photo_url;
+
+    let imgUrl = null;
+    if (sciName && photoUrl) {
+      imgUrl = await copyObservationImageToSpeciesFolder(sciName, photoUrl);
+
+      if (imgUrl) {
+        await pool.query(
+          'UPDATE species SET image_url = COALESCE(image_url, ?) WHERE species_id = ?',
+          [imgUrl, resolvedSpeciesId]
+        );
+      }
+    }
+
+    await attachObservationToSpecies({
+      observation_id,
+      species_id: resolvedSpeciesId,
+      status: 'verified',
+    });
+
+    // optionally notify python worker later
+
+    res.json({
+      ok: true,
+      observation_id,
+      species_id: resolvedSpeciesId,
+      scientific_name: sciName,
+      image_url: imgUrl,
+    });
+  } catch (err) {
+    console.error('[confirm-existing] error', err);
+    res.status(500).json({ error: 'Failed to confirm observation' });
+  }
+});
+
+
+// Admin confirms observation as a NEW species
+app.post('/api/admin/observations/:id/confirm-new', async (req, res) => {
+  try {
+    const observation_id = Number(req.params.id);
+    const {
+      scientific_name,
+      common_name,
+      is_endangered,
+      description,
+    } = req.body;
+
+    if (!Number.isFinite(observation_id)) {
+      return res.status(400).json({ error: 'Invalid observation_id' });
+    }
+    if (!scientific_name) {
+      return res.status(400).json({ error: 'scientific_name is required' });
+    }
+
+    const detail = await getObservationWithResults(observation_id);
+    if (!detail || !detail.observation) {
+      return res.status(404).json({ error: 'Observation not found' });
+    }
+
+    const photoUrl = detail.observation.photo_url;
+
+    // copy observation image into species_images/scientific_name/
+    const imgUrl = await copyObservationImageToSpeciesFolder(
+      scientific_name,
+      photoUrl
+    );
+
+    // insert species row
+    const species_id = await insertSpecies({
+      scientific_name,
+      common_name,
+      is_endangered: Boolean(Number(is_endangered)),
+      description,
+      image_url: imgUrl,
+    });
+
+    // link observation to this species
+    await attachObservationToSpecies({
+      observation_id,
+      species_id,
+      status: 'verified',
+    });
+
+    // TODO: later: send training sample to python worker
+
+    res.json({
+      ok: true,
+      observation_id,
+      species_id,
+      scientific_name,
+      image_url: imgUrl,
+    });
+  } catch (err) {
+    console.error('[confirm-new] error', err);
+    res.status(500).json({ error: 'Failed to confirm new species' });
+  }
+});
+
 
 // Mount so both /admin/* and /api/admin/* work
 app.use('/admin', adminRouter);
@@ -351,6 +501,36 @@ app.post('/scan', upload.single('image'), async (req, res) => {
     return res.status(500).json({ error: 'Server error' });
   }
 });
+
+function slugifyName(name) {
+  return String(name)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+async function copyObservationImageToSpeciesFolder(scientific_name, photoUrl) {
+  if (!scientific_name || !photoUrl) return null;
+
+  const safeName = slugifyName(scientific_name);
+  const speciesDir = path.join(SPECIES_IMAGE_ROOT, safeName);
+
+  await fs.promises.mkdir(speciesDir, { recursive: true });
+
+  const filename = path.basename(photoUrl);
+  const uploadsDir = path.join(__dirname, '..'); // server root
+  const srcPath = path.join(uploadsDir, photoUrl.replace(/^\//, ''));
+  const destPath = path.join(speciesDir, filename);
+
+  await fs.promises.copyFile(srcPath, destPath);
+
+  // URL you will store in DB
+  const publicUrl = `/species_images/${safeName}/${filename}`;
+  return publicUrl;
+}
+
+app.use('/species_images', express.static(path.join(__dirname, '..', 'species_images')));
 
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => console.log(`SmartPlant API on http://localhost:${PORT}`));

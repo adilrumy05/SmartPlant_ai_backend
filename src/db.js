@@ -1,4 +1,10 @@
 import mysql from 'mysql2/promise'; // Promise based for async/await support
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Create a connection pool for efficient MySQL database access
 const pool = mysql.createPool({
@@ -12,6 +18,50 @@ const pool = mysql.createPool({
   queueLimit: 0, // Unlimited queue size for pending requests
   decimalNumbers: true // Return DECIMAL/NUMERIC fields as numbers (not strings)
 });
+
+export async function insertSpecies({
+  scientific_name,
+  common_name = null,
+  is_endangered = false,
+  description = null,
+  image_url = null,
+}) {
+  if (!scientific_name) {
+    throw new Error('scientific_name is required');
+  }
+
+  const endangeredFlag = is_endangered ? 1 : 0;
+
+  const [result] = await pool.query(
+    `
+      INSERT INTO species
+        (scientific_name, common_name, is_endangered, description, image_url, created_at)
+      VALUES (?, ?, ?, ?, ?, NOW())
+    `,
+    [scientific_name, common_name, endangeredFlag, description, image_url]
+  );
+
+  return result.insertId;
+}
+
+export async function attachObservationToSpecies({
+  observation_id,
+  species_id,
+  status = 'verified',
+}) {
+  if (!observation_id || !species_id) {
+    throw new Error('observation_id and species_id are required');
+  }
+
+  await pool.query(
+    `
+      UPDATE plant_observations
+      SET species_id = ?, status = ?
+      WHERE observation_id = ?
+    `,
+    [species_id, status, observation_id]
+  );
+}
 
 // Retrieve species_id from database if it exists, otherwise, insert a new record and return the new ID
 export async function getOrCreateSpeciesId(scientific_name) {
@@ -148,6 +198,8 @@ export async function listObservationsByStatus(
       ${topExpr} AS top_confidence,
       po.created_at,
       po.location_name,
+      po.location_latitude,
+      po.location_longitude,
       po.user_id,
       (
         SELECT s.scientific_name
@@ -166,6 +218,8 @@ export async function listObservationsByStatus(
       po.status,
       po.created_at,
       po.location_name,
+      po.location_latitude,
+      po.location_longitude,
       po.user_id
   `);
 
